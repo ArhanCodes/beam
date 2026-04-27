@@ -43,13 +43,11 @@ pub async fn run_web(addr: SocketAddr) -> Result<()> {
         storage_dir,
     };
 
-    // Determine static files directory
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // Check multiple locations for the built frontend
     let static_dir = [
         PathBuf::from("web/dist"),
         PathBuf::from("frontend/dist"),

@@ -103,7 +103,7 @@ export function SendPanel() {
           <div className="dropzone-icon">&#8593;</div>
           <div className="dropzone-text">Drop a file here or click to browse</div>
           <div className="dropzone-hint">
-            Any file, any size — encrypted before upload
+            Any file, any size - encrypted before upload
           </div>
         </div>
       )}
@@ -127,7 +127,7 @@ export function SendPanel() {
             {filename} ({formatSize(fileSize)})
           </div>
           <div className="encryption-note">
-            AES-256-GCM encrypted — key is embedded in the code above
+            AES-256-GCM encrypted - key is embedded in the code above
           </div>
           <button className="copy-btn" onClick={copyCode}>
             {copyText}

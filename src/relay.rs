@@ -20,7 +20,6 @@ struct Session {
 
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
 
-/// Run the signaling relay server
 pub async fn run_relay(addr: SocketAddr) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!("Relay server listening on {}", addr);
@@ -50,7 +49,6 @@ async fn handle_connection(
     let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
-    // Spawn task to forward messages from channel to WebSocket
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_sink.send(msg).await.is_err() {
@@ -87,12 +85,9 @@ async fn handle_connection(
                     if let Some(session) = sessions.get_mut(&code) {
                         session.receiver_tx = Some(tx.clone());
 
-                        // Notify sender that receiver joined
                         let notify = serde_json::to_string(&SignalMessage::PeerJoined)?;
                         let _ = session.sender_tx.send(Message::Text(notify.into()));
 
-                        // Tell both peers to use relay mode for simplicity
-                        // (direct connection via NAT hole-punching is attempted separately)
                         let peer_addr_msg = serde_json::to_string(&SignalMessage::PeerInfo {
                             addr: peer_addr.to_string(),
                         })?;
@@ -105,7 +100,7 @@ async fn handle_connection(
                     }
                 }
                 Ok(SignalMessage::PeerInfo { addr }) => {
-                    // Forward peer info to the other side
+
                     let sessions = sessions.lock().await;
                     if let Some(code) = &my_code {
                         if let Some(session) = sessions.get(code) {
@@ -130,7 +125,6 @@ async fn handle_connection(
         }
     }
 
-    // Cleanup on disconnect
     if let Some(code) = my_code {
         let mut sessions = sessions.lock().await;
         if is_sender {

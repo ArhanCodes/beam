@@ -65,7 +65,6 @@ export function ReceivePanel() {
         finalBlob = new Blob([data.buffer as ArrayBuffer]);
       }
 
-      // Trigger browser download
       const url = URL.createObjectURL(finalBlob);
       const a = document.createElement("a");
       a.href = url;
@@ -74,7 +73,7 @@ export function ReceivePanel() {
       URL.revokeObjectURL(url);
 
       setSuccess(
-        `Downloaded ${filename} (${formatSize(finalBlob.size)})${encKey ? " — decrypted" : ""}`
+        `Downloaded ${filename} (${formatSize(finalBlob.size)})${encKey ? " - decrypted" : ""}`
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "Download failed");

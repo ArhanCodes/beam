@@ -1,5 +1,6 @@
 mod code;
 mod crypto;
+mod handshake;
 mod nat;
 mod protocol;
 mod relay;
@@ -30,40 +31,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Send a file
+
     Send {
-        /// Path to the file to send
+
         file: PathBuf,
 
-        /// Relay server address
         #[arg(long, default_value = "127.0.0.1:7700")]
         relay: String,
     },
 
-    /// Receive a file
     Receive {
-        /// Transfer code (e.g. 7-amber-wolf)
+
         code: String,
 
-        /// Output directory
         #[arg(short, long, default_value = ".")]
         output: PathBuf,
 
-        /// Relay server address
         #[arg(long, default_value = "127.0.0.1:7700")]
         relay: String,
     },
 
-    /// Run the signaling relay server
     Relay {
-        /// Address to bind to
+
         #[arg(short, long, default_value = "127.0.0.1:7700")]
         bind: SocketAddr,
     },
 
-    /// Run the web UI
     Web {
-        /// Address to bind to
+
         #[arg(short, long, default_value = "127.0.0.1:3000")]
         bind: SocketAddr,
     },
@@ -95,7 +90,7 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_send(file: PathBuf, relay_addr: String) -> Result<()> {
-    // Validate file exists
+
     if !file.exists() {
         anyhow::bail!("File not found: {}", file.display());
     }
@@ -112,20 +107,17 @@ async fn cmd_send(file: PathBuf, relay_addr: String) -> Result<()> {
     println!("  File: {}", filename);
     println!("  Size: {}", format_size(metadata.len()));
 
-    // Generate transfer code
     let transfer_code = code::generate_code();
 
-    // Start QUIC server for direct transfer
     let quic_addr: SocketAddr = "0.0.0.0:0".parse()?;
-    let local_addr = transfer::send_file(&file, quic_addr).await?;
-    // Replace 0.0.0.0 with 127.0.0.1 for local connections
+    let local_addr = transfer::send_file(&file, quic_addr, transfer_code.clone()).await?;
+
     let advertise_addr = if local_addr.ip().is_unspecified() {
         SocketAddr::new("127.0.0.1".parse()?, local_addr.port())
     } else {
         local_addr
     };
 
-    // Connect to relay and register
     let relay_url = format!("ws://{}", relay_addr);
     let (ws_stream, _) = tokio_tungstenite::connect_async(&relay_url)
         .await
@@ -136,7 +128,6 @@ async fn cmd_send(file: PathBuf, relay_addr: String) -> Result<()> {
 
     let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
 
-    // Register with relay
     let register = serde_json::to_string(&SignalMessage::Register {
         code: transfer_code.clone(),
     })?;
@@ -147,14 +138,12 @@ async fn cmd_send(file: PathBuf, relay_addr: String) -> Result<()> {
     println!("  beam receive {}", transfer_code);
     println!("\n  Waiting for receiver...");
 
-    // Wait for peer to join
     while let Some(Ok(msg)) = ws_stream_rx.next().await {
         if let Message::Text(text) = msg {
             match serde_json::from_str::<SignalMessage>(&text) {
                 Ok(SignalMessage::PeerJoined) => {
                     println!("  Receiver connected!");
 
-                    // Send our QUIC address to receiver via relay
                     let peer_info = serde_json::to_string(&SignalMessage::PeerInfo {
                         addr: advertise_addr.to_string(),
                     })?;
@@ -176,10 +165,8 @@ async fn cmd_receive(transfer_code: String, output: PathBuf, relay_addr: String)
     println!("  ────────────────────────────");
     println!("  Code: {}", transfer_code);
 
-    // Ensure output directory exists
     tokio::fs::create_dir_all(&output).await?;
 
-    // Connect to relay
     let relay_url = format!("ws://{}", relay_addr);
     let (ws_stream, _) = tokio_tungstenite::connect_async(&relay_url)
         .await
@@ -190,7 +177,6 @@ async fn cmd_receive(transfer_code: String, output: PathBuf, relay_addr: String)
 
     let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
 
-    // Join with code
     let join = serde_json::to_string(&SignalMessage::Join {
         code: transfer_code.clone(),
     })?;
@@ -198,7 +184,6 @@ async fn cmd_receive(transfer_code: String, output: PathBuf, relay_addr: String)
 
     println!("  Connecting to sender...");
 
-    // Wait for sender's address
     while let Some(Ok(msg)) = ws_stream_rx.next().await {
         if let Message::Text(text) = msg {
             match serde_json::from_str::<SignalMessage>(&text) {
@@ -206,9 +191,8 @@ async fn cmd_receive(transfer_code: String, output: PathBuf, relay_addr: String)
                     info!("Sender address: {}", addr);
                     let sender_addr: SocketAddr = addr.parse()?;
 
-                    // Connect directly via QUIC
                     println!("  Connected!\n");
-                    transfer::receive_file(sender_addr, &output).await?;
+                    transfer::receive_file(sender_addr, &output, &transfer_code).await?;
                     println!("\n  Done!\n");
                     return Ok(());
                 }

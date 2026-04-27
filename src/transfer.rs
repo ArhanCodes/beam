@@ -4,17 +4,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use quinn::{Endpoint, ServerConfig};
+use quinn::{Endpoint, RecvStream, SendStream, ServerConfig};
 use sha2::{Digest, Sha256};
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 
+use crate::handshake;
 use crate::protocol::TransferMessage;
 
-const CHUNK_SIZE: usize = 64 * 1024; // 64 KB chunks
+const CHUNK_SIZE: usize = 64 * 1024;
+const ENCRYPTED_CHUNK_OVERHEAD: usize = 16;
 
-/// Generate self-signed TLS certs for QUIC
 fn generate_self_signed_cert() -> Result<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)> {
     let cert = rcgen::generate_simple_self_signed(vec!["beam".into()])?;
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert);
@@ -29,7 +30,7 @@ fn make_server_config() -> Result<ServerConfig> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)?;
-    server_crypto.alpn_protocols = vec![b"beam/1".to_vec()];
+    server_crypto.alpn_protocols = vec![b"beam/2".to_vec()];
     Ok(ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     )))
@@ -40,13 +41,12 @@ fn make_client_config() -> Result<quinn::ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![b"beam/1".to_vec()];
+    client_crypto.alpn_protocols = vec![b"beam/2".to_vec()];
     Ok(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     )))
 }
 
-/// Skip TLS verification (we use SPAKE2 for authentication)
 #[derive(Debug)]
 struct SkipServerVerification;
 
@@ -89,17 +89,15 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-/// Send a file over QUIC
-pub async fn send_file(file_path: &Path, listen_addr: SocketAddr) -> Result<SocketAddr> {
+pub async fn send_file(file_path: &Path, listen_addr: SocketAddr, code: String) -> Result<SocketAddr> {
     let server_config = make_server_config()?;
     let endpoint = Endpoint::server(server_config, listen_addr)?;
     let local_addr = endpoint.local_addr()?;
     info!("QUIC sender listening on {}", local_addr);
 
-    // Spawn the actual transfer in a background task so we can return the address
     let file_path = file_path.to_path_buf();
     tokio::spawn(async move {
-        if let Err(e) = send_file_inner(&endpoint, &file_path).await {
+        if let Err(e) = send_file_inner(&endpoint, &file_path, &code).await {
             eprintln!("Transfer error: {}", e);
         }
         endpoint.close(0u32.into(), b"done");
@@ -108,7 +106,7 @@ pub async fn send_file(file_path: &Path, listen_addr: SocketAddr) -> Result<Sock
     Ok(local_addr)
 }
 
-async fn send_file_inner(endpoint: &Endpoint, file_path: &Path) -> Result<()> {
+async fn send_file_inner(endpoint: &Endpoint, file_path: &Path, code: &str) -> Result<()> {
     let conn = endpoint.accept().await
         .context("No incoming connection")?
         .await?;
@@ -116,7 +114,10 @@ async fn send_file_inner(endpoint: &Endpoint, file_path: &Path) -> Result<()> {
 
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    // Read file metadata
+    let session_key = handshake::perform_sender_handshake(code, &mut send, &mut recv).await?;
+    println!("  E2E handshake complete: SPAKE2 + ML-KEM-768 + ChaCha20-Poly1305");
+    let cipher = handshake::make_aead(&session_key)?;
+
     let metadata = tokio::fs::metadata(file_path).await?;
     let file_size = metadata.len();
     let filename = file_path
@@ -125,25 +126,19 @@ async fn send_file_inner(endpoint: &Endpoint, file_path: &Path) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    // Compute checksum
     let checksum = compute_file_checksum(file_path).await?;
 
-    // Send file header
     let header = TransferMessage::FileHeader {
         filename: filename.clone(),
         size: file_size,
         checksum: checksum.clone(),
     };
     let header_bytes = header.to_bytes()?;
-    send.write_all(&(header_bytes.len() as u32).to_be_bytes()).await?;
-    send.write_all(&header_bytes).await?;
+    let header_ct = handshake::seal(&cipher, 0, &header_bytes)?;
+    write_frame(&mut send, &header_ct).await?;
 
-    // Wait for Ready
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-    let mut msg_buf = vec![0u8; msg_len];
-    recv.read_exact(&mut msg_buf).await?;
+    let ready_ct = read_frame(&mut recv).await?;
+    let _ready = handshake::open(&cipher, 1, &ready_ct)?;
 
     let pb = ProgressBar::new(file_size);
     pb.set_style(
@@ -152,17 +147,21 @@ async fn send_file_inner(endpoint: &Endpoint, file_path: &Path) -> Result<()> {
             .progress_chars("=>-"),
     );
 
-    // Stream file data
     let mut file = File::open(file_path).await?;
     let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut counter: u64 = 2;
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        send.write_all(&buf[..n]).await?;
+        let ct = handshake::seal(&cipher, counter, &buf[..n])?;
+        write_frame(&mut send, &ct).await?;
+        counter += 1;
         pb.inc(n as u64);
     }
+    let final_ct = handshake::seal(&cipher, counter, b"END")?;
+    write_frame(&mut send, &final_ct).await?;
     send.finish()?;
 
     pb.finish_with_message("Transfer complete!");
@@ -172,10 +171,10 @@ async fn send_file_inner(endpoint: &Endpoint, file_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Receive a file over QUIC
 pub async fn receive_file(
     sender_addr: SocketAddr,
     output_dir: &Path,
+    code: &str,
 ) -> Result<()> {
     let client_config = make_client_config()?;
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
@@ -186,14 +185,14 @@ pub async fn receive_file(
 
     let (mut send, mut recv) = conn.accept_bi().await?;
 
-    // Receive file header
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
-    let msg_len = u32::from_be_bytes(len_buf) as usize;
-    let mut msg_buf = vec![0u8; msg_len];
-    recv.read_exact(&mut msg_buf).await?;
+    let session_key = handshake::perform_receiver_handshake(code, &mut send, &mut recv).await?;
+    println!("  E2E handshake complete: SPAKE2 + ML-KEM-768 + ChaCha20-Poly1305");
+    let cipher = handshake::make_aead(&session_key)?;
 
-    let header = TransferMessage::from_bytes(&msg_buf)?;
+    let header_ct = read_frame(&mut recv).await?;
+    let header_bytes = handshake::open(&cipher, 0, &header_ct)?;
+
+    let header = TransferMessage::from_bytes(&header_bytes)?;
     let (filename, file_size, expected_checksum) = match header {
         TransferMessage::FileHeader {
             filename,
@@ -205,10 +204,9 @@ pub async fn receive_file(
 
     println!("  Receiving: {} ({})", filename, format_size(file_size));
 
-    // Send Ready
     let ready = TransferMessage::Ready.to_bytes()?;
-    send.write_all(&(ready.len() as u32).to_be_bytes()).await?;
-    send.write_all(&ready).await?;
+    let ready_ct = handshake::seal(&cipher, 1, &ready)?;
+    write_frame(&mut send, &ready_ct).await?;
 
     let pb = ProgressBar::new(file_size);
     pb.set_style(
@@ -217,28 +215,30 @@ pub async fn receive_file(
             .progress_chars("=>-"),
     );
 
-    // Receive file data
     let output_path = output_dir.join(&filename);
     let mut file = File::create(&output_path).await?;
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut counter: u64 = 2;
 
     loop {
-        match recv.read(&mut buf).await {
-            Ok(Some(n)) => {
-                file.write_all(&buf[..n]).await?;
-                hasher.update(&buf[..n]);
-                pb.inc(n as u64);
-            }
-            Ok(None) => break,
+        let frame = match read_frame(&mut recv).await {
+            Ok(f) => f,
             Err(e) => {
-                // Connection closed cleanly by sender — this is expected
-                if e.to_string().contains("closed") || e.to_string().contains("reset") {
+                let s = e.to_string();
+                if s.contains("closed") || s.contains("reset") || s.contains("eof") {
                     break;
                 }
-                return Err(e.into());
+                return Err(e);
             }
+        };
+        let plain = handshake::open(&cipher, counter, &frame)?;
+        counter += 1;
+        if plain == b"END" {
+            break;
         }
+        file.write_all(&plain).await?;
+        hasher.update(&plain);
+        pb.inc(plain.len() as u64);
     }
 
     pb.finish_with_message("Transfer complete!");
@@ -257,6 +257,25 @@ pub async fn receive_file(
 
     endpoint.close(0u32.into(), b"done");
     Ok(())
+}
+
+async fn write_frame(send: &mut SendStream, data: &[u8]) -> Result<()> {
+    let len = data.len() as u32;
+    send.write_all(&len.to_be_bytes()).await?;
+    send.write_all(data).await?;
+    Ok(())
+}
+
+async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > CHUNK_SIZE + ENCRYPTED_CHUNK_OVERHEAD + 4096 {
+        anyhow::bail!("oversized frame: {}", len);
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf).await?;
+    Ok(buf)
 }
 
 async fn compute_file_checksum(path: &Path) -> Result<String> {

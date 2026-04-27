@@ -1,8 +1,8 @@
 [package]
 name = "beam"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Peer-to-peer file transfer. No servers, no sign-ups, just beam it."
+description = "Peer-to-peer file transfer with end-to-end encryption."
 license = "MIT"
 
 [dependencies]
@@ -13,8 +13,14 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 spake2 = "0.4"
+ml-kem = { version = "0.2", features = ["zeroize"] }
+kem = "=0.3.0-pre.0"
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+zeroize = "1.7"
 indicatif = "0.17"
 rand = "0.8"
+rand_core = "0.6"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

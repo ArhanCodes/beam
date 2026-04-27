@@ -31,7 +31,6 @@ const NOUNS: &[&str] = &[
     "veil", "vine", "wave", "wren", "wolf", "wood", "yard", "yew",
 ];
 
-/// Generate a human-readable transfer code like "7-amber-wolf"
 pub fn generate_code() -> String {
     let mut rng = rand::thread_rng();
     let num = rng.gen_range(1..100);
@@ -40,7 +39,6 @@ pub fn generate_code() -> String {
     format!("{}-{}-{}", num, adj, noun)
 }
 
-/// Convert a code string into bytes for use as a SPAKE2 password
 pub fn code_to_bytes(code: &str) -> Vec<u8> {
     code.as_bytes().to_vec()
 }
