@@ -102,9 +102,6 @@ export function SendPanel() {
         >
           <div className="dropzone-icon">&#8593;</div>
           <div className="dropzone-text">Drop a file here or click to browse</div>
-          <div className="dropzone-hint">
-            Any file, any size - encrypted before upload
-          </div>
         </div>
       )}
 
